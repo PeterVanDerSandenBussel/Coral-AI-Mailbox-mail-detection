@@ -20,11 +20,11 @@ from pycoral.adapters import detect
 from waitress import serve
 from concurrent.futures import ThreadPoolExecutor
 
-# --- 1. CONFIGURATIE (gelezen uit config.ini) ---
+# --- 1. CONFIGURATION (read from config.ini) ---
 _cfg = configparser.ConfigParser()
 _cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.ini')
 if not _cfg.read(_cfg_path):
-    raise FileNotFoundError(f"config.ini niet gevonden op {_cfg_path}")
+    raise FileNotFoundError(f"config.ini not found at {_cfg_path}")
 
 MODEL_PATH = _cfg.get('camera', 'model_path')
 LABEL_PATH = _cfg.get('camera', 'label_path')
@@ -50,17 +50,17 @@ NIGHT_INTERVAL       = _cfg.getfloat('detectie', 'night_interval')
 TARGET_LABELS        = [l.strip() for l in _cfg.get('detectie', 'target_labels').split(',')]
 
 # =============================================================================
-# POST-DETECTIE CONFIGURATIE
+# MAIL DELIVERY DETECTION CONFIGURATION
 #
-# Alle zones in AI-coordinaten (0-300), want cx_ai/cy_ai zijn AI-coordinaten.
+# All zones are in AI coordinates (0-300), since cx_ai/cy_ai are AI coordinates.
 #
-# Postbode-patroon (uit logging):
-#   AANKOMST : van rechtsboven  cx > ARRIVE_MIN_CX, cy < ARRIVE_MAX_CY
-#   BRIEVENBUS: cx ~ 78-102, cy ~ 130-188  MAILBOX_ZONE_AI
-#   VERTREK  : terug naar rechtsboven       cx > DEPART_MIN_CX
+# Mail carrier pattern (from logging):
+#   ARRIVAL : from top-right  cx > ARRIVE_MIN_CX, cy < ARRIVE_MAX_CY
+#   MAILBOX : cx ~ 78-102, cy ~ 130-188  MAILBOX_ZONE_AI
+#   DEPARTURE: back to top-right       cx > DEPART_MIN_CX
 #
-# EXCLUDE_ZONE_AI: gebied rechtsboven waar voorbijgangers lopen
-#   AI [200,0] t/m [300,70] = rechtsboven hoek, voorbijgangerspad
+# EXCLUDE_ZONE_AI: area top-right where passersby walk
+#   AI [200,0] through [300,70] = top-right corner, passerby path
 # =============================================================================
 
 def _parse_zone(s):
@@ -82,17 +82,17 @@ TRACKER_MAX_DISAPPEARED  = _cfg.getint('tracker', 'max_disappeared')
 TRACKER_RESET_SECONDS    = _cfg.getint('tracker', 'reset_seconds')
 TRACKER_MAX_TRACE_POINTS = _cfg.getint('tracker', 'max_trace_points')
 
-# debug-overlay
+# debug overlay
 DRAW_DEBUG        = _cfg.getboolean('debug', 'draw_debug')
 DRAW_TRACES_DEBUG = _cfg.getboolean('debug', 'draw_traces_debug')
 
-# Camera belasting: maximale framerate voor de reader-thread en detectie-loop.
-# Hikvision levert doorgaans 25fps; 8fps is ruim voldoende voor loopdetectie.
-# Pas ook aan in config.ini als gewenst: [camera] reader_fps / detect_fps
+# Camera load: maximum frame rate for the reader thread and detection loop.
+# Hikvision typically delivers 25fps; 8fps is more than enough for walking detection.
+# Also adjustable in config.ini if desired: [camera] reader_fps / detect_fps
 READER_FPS  = _cfg.getfloat('camera', 'reader_fps')   if _cfg.has_option('camera', 'reader_fps')  else 15.0
 DETECT_FPS  = _cfg.getfloat('camera', 'detect_fps')   if _cfg.has_option('camera', 'detect_fps')  else  8.0
-_READER_INTERVAL = 1.0 / READER_FPS   # seconden tussen reads
-_DETECT_INTERVAL = 1.0 / DETECT_FPS   # seconden tussen detecties
+_READER_INTERVAL = 1.0 / READER_FPS   # seconds between reads
+_DETECT_INTERVAL = 1.0 / DETECT_FPS   # seconds between detections
 
 output_frame = None
 lock = threading.Lock()
@@ -100,7 +100,6 @@ is_night = False
 
 app = Flask(__name__)
 
-# FIX 2: gedeelde thread-pool voor alle MQTT/mail async taken (max 2 workers)
 _async_executor = ThreadPoolExecutor(max_workers=2)
 
 client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2, client_id="")
@@ -110,38 +109,38 @@ client.loop_start()
 
 
 # =============================================================================
-# E-MAIL FUNCTIE
+# EMAIL FUNCTION
 # =============================================================================
 def send_post_email(jpeg_bytes):
-    """Stuurt een e-mail met snapshot bij post detectie. Draait via executor."""
+    """Sends an email with a snapshot when mail delivery is detected. Runs via the executor."""
     if not MAIL_ENABLED:
         return
     def _send(data):
         try:
             ts = datetime.datetime.now().strftime('%d-%m-%Y %H:%M:%S')
             msg = MIMEMultipart()
-            msg['Subject'] = f"Post bezorgd! 📬 {ts}"
+            msg['Subject'] = f"Mail delivered! 📬 {ts}"
             msg['From']    = f"{MAIL_FROM_NAME} <{MAIL_FROM}>"
             msg['To']      = MAIL_TO
-            msg.attach(MIMEText(f"De postbode is gedetecteerd op {ts}.", 'plain'))
+            msg.attach(MIMEText(f"The mail carrier was detected at {ts}.", 'plain'))
             msg.attach(MIMEImage(data, name="post_snapshot.jpg"))
             with smtplib.SMTP(MAIL_SMTP_SERVER, MAIL_SMTP_PORT, timeout=10) as smtp:
                 smtp.sendmail(MAIL_FROM, MAIL_TO, msg.as_string())
-            print(f"[MAIL] Verstuurd naar {MAIL_TO} om {ts}")
+            print(f"[MAIL] Sent to {MAIL_TO} at {ts}")
         except Exception as e:
-            print(f"[MAIL] Fout: {e}")
+            print(f"[MAIL] Error: {e}")
     _async_executor.submit(_send, jpeg_bytes)
 
 
 # =============================================================================
-# HULPFUNCTIES: zone-check in AI-coordinaten
+# HELPER FUNCTIONS: zone check in AI coordinates
 # =============================================================================
 def point_in_zone_ai(cx_ai, cy_ai, zone_ai):
-    """Controleert of een AI-centroide binnen een AI-zone valt."""
+    """Checks whether an AI centroid falls within an AI zone."""
     return zone_ai[0] <= cx_ai <= zone_ai[2] and zone_ai[1] <= cy_ai <= zone_ai[3]
 
 def ai_to_px(ai_x, ai_y, frame_w, frame_h):
-    """Zet AI-coordinaten (300x300) om naar pixel-coordinaten voor tekenen."""
+    """Converts AI coordinates (300x300) to pixel coordinates for drawing."""
     size = min(frame_h, frame_w)
     start_x = (frame_w - size) // 2
     start_y = (frame_h - size) // 2
@@ -150,26 +149,26 @@ def ai_to_px(ai_x, ai_y, frame_w, frame_h):
     return px_x, px_y
 
 def ai_zone_to_px(zone_ai, frame_w, frame_h):
-    """Zet AI-zone om naar pixel-rechthoek voor tekenen."""
+    """Converts an AI zone to a pixel rectangle for drawing."""
     x1, y1 = ai_to_px(zone_ai[0], zone_ai[1], frame_w, frame_h)
     x2, y2 = ai_to_px(zone_ai[2], zone_ai[3], frame_w, frame_h)
     return x1, y1, x2, y2
 
 
 # =============================================================================
-# STATE MACHINE PER PERSOON
+# STATE MACHINE PER PERSON
 #
-# Drie harde voorwaarden voor POST_CONFIRMED:
-#   1. AANKOMST  - track start rechts (cx > ARRIVE_MIN_CX), niet in exclude-zone,
-#                  en beweegt naar linksonder richting brievenbus
-#   2. POST      - persoon in MAILBOX_ZONE_AI tussen MAILBOX_DWELL_MIN en MAILBOX_DWELL_MAX sec
-#   3. VERTREK   - persoon verlaat mailbox en beweegt terug naar rechts (cx > DEPART_MIN_CX)
+# Three hard requirements for POST_CONFIRMED:
+#   1. ARRIVAL  - track starts on the right (cx > ARRIVE_MIN_CX), not in the exclude zone,
+#                 and moves toward the bottom-left, toward the mailbox
+#   2. DELIVERY - person in MAILBOX_ZONE_AI for between MAILBOX_DWELL_MIN and MAILBOX_DWELL_MAX sec
+#   3. DEPARTURE- person leaves the mailbox and moves back to the right (cx > DEPART_MIN_CX)
 #
-# Valse vlaggen worden voorkomen door:
-#   - Exclude zone rechtsboven: voorbijgangers die niet naar brievenbus gaan
-#   - Richtingseis aankomst: cx moet afnemen op weg naar brievenbus
-#   - Richtingseis vertrek: cx moet toenemen na brievenbus
-#   - Dwell max: te lang stilstaan = geen postbode
+# False positives are prevented by:
+#   - Exclude zone top-right: passersby who are not heading to the mailbox
+#   - Direction requirement on arrival: cx must decrease on the way to the mailbox
+#   - Direction requirement on departure: cx must increase after the mailbox
+#   - Max dwell: standing still too long = not the mail carrier
 # =============================================================================
 POST_STATE_IDLE      = "IDLE"
 POST_STATE_APPROACH  = "APPROACHING"
@@ -179,15 +178,15 @@ POST_STATE_CONFIRMED = "POST_CONFIRMED"
 
 
 class PostTracker:
-    """Bijhoudt de postbezorgstatus per persoon-ID met richtingsdetectie."""
+    """Tracks the mail delivery status per person ID with direction detection."""
     def __init__(self):
         self.states        = {}   # obj_id -> state
-        self.approach_entry= {}   # obj_id -> timestamp aankomst approach
-        self.mailbox_entry = {}   # obj_id -> timestamp aankomst mailbox
-        self.confirmed_time= {}   # obj_id -> timestamp bevestiging
-        self.first_cx      = {}   # obj_id -> eerste cx (voor richtingscheck aankomst)
-        self.cx_history    = {}   # obj_id -> lijst van recente cx waarden
-        self.arrived_from_right = set()  # IDs die aantoonbaar van rechts kwamen
+        self.approach_entry= {}   # obj_id -> timestamp of approach start
+        self.mailbox_entry = {}   # obj_id -> timestamp of mailbox arrival
+        self.confirmed_time= {}   # obj_id -> timestamp of confirmation
+        self.first_cx      = {}   # obj_id -> first cx (for arrival direction check)
+        self.cx_history    = {}   # obj_id -> list of recent cx values
+        self.arrived_from_right = set()  # IDs that demonstrably came from the right
 
     def get_state(self, obj_id):
         return self.states.get(obj_id, POST_STATE_IDLE)
@@ -196,7 +195,7 @@ class PostTracker:
         return point_in_zone_ai(cx_ai, cy_ai, EXCLUDE_ZONE_AI)
 
     def _moving_left(self, obj_id, cx_ai):
-        """Beweegt de persoon naar links (cx neemt af)?"""
+        """Is the person moving left (cx decreasing)?"""
         hist = self.cx_history.get(obj_id, [])
         if len(hist) < 3:
             return False
@@ -204,7 +203,7 @@ class PostTracker:
         return cx_ai < avg_prev - 2
 
     def _moving_right(self, obj_id, cx_ai):
-        """Beweegt de persoon naar rechts (cx neemt toe)?"""
+        """Is the person moving right (cx increasing)?"""
         hist = self.cx_history.get(obj_id, [])
         if len(hist) < 3:
             return False
@@ -218,28 +217,28 @@ class PostTracker:
         in_mailbox = point_in_zone_ai(cx_ai, cy_ai, MAILBOX_ZONE_AI)
         in_exclude = self._in_exclude(cx_ai, cy_ai)
 
-        # Bijhouden cx-geschiedenis voor richtingsdetectie
+        # Track cx history for direction detection
         if obj_id not in self.cx_history:
             self.cx_history[obj_id] = []
         self.cx_history[obj_id].append(cx_ai)
         if len(self.cx_history[obj_id]) > 10:
             self.cx_history[obj_id].pop(0)
 
-        # Eerste cx vastleggen
+        # Record first cx
         if obj_id not in self.first_cx:
             self.first_cx[obj_id] = cx_ai
 
         print(f"[ZONE] ID={obj_id} cx={cx_ai:.0f} cy={cy_ai:.0f} "
               f"mailbox={in_mailbox} excl={in_exclude} state={current_state}")
 
-        # --- Cooldown na bevestiging ---
+        # --- Cooldown after confirmation ---
         if current_state == POST_STATE_CONFIRMED:
             if now - self.confirmed_time.get(obj_id, 0) > POST_COOLDOWN_SECONDS:
                 self._reset(obj_id)
             return self.states.get(obj_id, POST_STATE_IDLE), True
 
         # =========================================================
-        # FASE 3 eerst: DEPARTING - check of persoon rechts vertrekt
+        # PHASE 3 first: DEPARTING - check whether person leaves to the right
         # =========================================================
         if current_state == POST_STATE_DEPARTING:
             if not in_mailbox and cx_ai > DEPART_MIN_CX and cy_ai < DEPART_MAX_CY:
@@ -248,13 +247,13 @@ class PostTracker:
             return POST_STATE_DEPARTING, False
 
         # =========================================================
-        # FASE 2: IN de mailbox
+        # PHASE 2: AT the mailbox
         # =========================================================
         elif current_state == POST_STATE_MAILBOX:
             if in_mailbox:
                 dwell = now - self.mailbox_entry.get(obj_id, now)
                 if dwell > MAILBOX_DWELL_MAX:
-                    print(f"[POST] ID={obj_id} -> RESET (dwell te lang: {dwell:.1f}s)")
+                    print(f"[POST] ID={obj_id} -> RESET (dwell too long: {dwell:.1f}s)")
                     self._reset(obj_id)
                 elif dwell >= MAILBOX_DWELL_MIN:
                     self.states[obj_id] = POST_STATE_DEPARTING
@@ -262,14 +261,14 @@ class PostTracker:
             else:
                 dwell = now - self.mailbox_entry.get(obj_id, now)
                 if dwell < MAILBOX_DWELL_MIN:
-                    print(f"[POST] ID={obj_id} -> terug APPROACH (dwell te kort: {dwell:.1f}s)")
+                    print(f"[POST] ID={obj_id} -> back to APPROACH (dwell too short: {dwell:.1f}s)")
                     self.states[obj_id] = POST_STATE_APPROACH
                 else:
                     self.states[obj_id] = POST_STATE_DEPARTING
-                    print(f"[POST] ID={obj_id} -> DEPARTING (verliet mailbox na {dwell:.1f}s)")
+                    print(f"[POST] ID={obj_id} -> DEPARTING (left mailbox after {dwell:.1f}s)")
 
         # =========================================================
-        # FASE 1b: APPROACHING - op weg naar brievenbus
+        # PHASE 1b: APPROACHING - on the way to the mailbox
         # =========================================================
         elif current_state == POST_STATE_APPROACH:
             if in_exclude:
@@ -282,12 +281,12 @@ class PostTracker:
                     self.states[obj_id] = POST_STATE_MAILBOX
                     print(f"[POST] ID={obj_id} -> AT_MAILBOX (approach={approach_time:.1f}s)")
                 else:
-                    reason = "approach te kort" if approach_time < APPROACH_MIN_SECONDS else "niet van rechts"
+                    reason = "approach too short" if approach_time < APPROACH_MIN_SECONDS else "did not arrive from the right"
                     print(f"[POST] ID={obj_id} -> RESET ({reason})")
                     self._reset(obj_id)
 
         # =========================================================
-        # FASE 1a: IDLE - wacht op aankomst van rechts
+        # PHASE 1a: IDLE - waiting for arrival from the right
         # =========================================================
         elif current_state == POST_STATE_IDLE:
             if in_exclude:
@@ -305,7 +304,7 @@ class PostTracker:
     def _confirm(self, obj_id, now):
         self.states[obj_id] = POST_STATE_CONFIRMED
         self.confirmed_time[obj_id] = now
-        print(f"[POST] ID={obj_id} POST BEVESTIGD op {datetime.datetime.now().strftime('%H:%M:%S')}")
+        print(f"[POST] ID={obj_id} DELIVERY CONFIRMED at {datetime.datetime.now().strftime('%H:%M:%S')}")
 
     def _reset(self, obj_id):
         for d in (self.states, self.approach_entry, self.mailbox_entry,
@@ -356,11 +355,11 @@ class CentroidTracker:
                         last_pos = self.objects.get(obj_id, (0, 0))
                         last_cx, last_cy = last_pos[0], last_pos[1]
                         if last_cx > DEPART_MIN_CX and last_cy < DEPART_MAX_CY:
-                            print(f"[POST] ID={obj_id} verdwenen rechtsboven tijdens DEPARTING -> POST BEVESTIGD")
+                            print(f"[POST] ID={obj_id} disappeared top-right during DEPARTING -> DELIVERY CONFIRMED")
                             self._post_tracker._confirm(obj_id, time.time())
                             self.pending_post_ids.add(obj_id)
                         else:
-                            print(f"[POST] ID={obj_id} verdwenen maar positie cx={last_cx:.0f} cy={last_cy:.0f} klopt niet, geen post")
+                            print(f"[POST] ID={obj_id} disappeared but position cx={last_cx:.0f} cy={last_cy:.0f} doesn't match, no delivery")
                     self._post_tracker.remove(obj_id)
                     self.deregister(obj_id)
             return self.objects
@@ -421,25 +420,22 @@ class CentroidTracker:
 
 
 # =============================================================================
-# STATE-KLEUREN voor overlay
+# STATE COLORS for overlay
 # =============================================================================
 STATE_COLORS = {
-    POST_STATE_IDLE:      (180, 180, 180),  # Grijs
-    POST_STATE_APPROACH:  (0, 200, 255),    # Geel-oranje
-    POST_STATE_MAILBOX:   (0, 165, 255),    # Oranje
-    POST_STATE_DEPARTING: (0, 100, 255),    # Oranje-rood
-    POST_STATE_CONFIRMED: (0, 0, 255),      # Rood (post bevestigd!)
+    POST_STATE_IDLE:      (180, 180, 180),  # Gray
+    POST_STATE_APPROACH:  (0, 200, 255),    # Yellow-orange
+    POST_STATE_MAILBOX:   (0, 165, 255),    # Orange
+    POST_STATE_DEPARTING: (0, 100, 255),    # Orange-red
+    POST_STATE_CONFIRMED: (0, 0, 255),      # Red (delivery confirmed!)
 }
 
 
 # =============================================================================
-# RTSP CAMERA READER - aparte thread met watchdog
-# FIX 1: watchdog wacht met thread.join() tot oude reader-thread echt gestopt is
-#         voordat een nieuwe wordt gestart. Voorkomt twee gelijktijdige cap.read()
-#         sessies naar de camera (connection limit op Hikvision).
+# RTSP CAMERA READER - separate thread with watchdog
 # =============================================================================
 class RTSPReader:
-    WATCHDOG_SECONDS = 8  # Na N seconden geen nieuw frame -> herverbinden
+    WATCHDOG_SECONDS = 8  # Reconnect after N seconds with no new frame
 
     def __init__(self, url):
         self.url = url
@@ -467,44 +463,43 @@ class RTSPReader:
                 with self._lock:
                     self._frame = frame
                     self._last_frame_time = time.time()
-                # Throttle: wacht rest van het frame-interval zodat we de camera
-                # niet sneller bevragen dan READER_FPS (standaard 15 fps).
+                # Throttle: wait out the rest of the frame interval so we
+                # don't poll the camera faster than READER_FPS (default 15 fps).
                 elapsed = time.time() - t0
                 wait = _READER_INTERVAL - elapsed
                 if wait > 0:
                     time.sleep(wait)
             else:
-                print("[CAM] cap.read() mislukt -- herverbinden...")
+                print("[CAM] cap.read() failed -- reconnecting...")
                 cap.release()
                 time.sleep(3)
                 if not self._stop_reader:
                     cap = self._make_cap()
         cap.release()
-        print("[CAM] Reader thread gestopt.")
+        print("[CAM] Reader thread stopped.")
 
     def _watchdog_loop(self):
-        """Detecteert vastgelopen stream. FIX 1: join() wacht tot oude thread klaar is."""
+        """Detects a stalled stream."""
         while True:
             time.sleep(3)
             if self._last_frame_time == 0:
                 continue
             age = time.time() - self._last_frame_time
             if age > self.WATCHDOG_SECONDS:
-                print(f"[CAM] Watchdog: geen frame sinds {age:.0f}s -- stream herstarten")
-                # FIX 1: stop oude thread en wacht tot hij echt klaar is
+                print(f"[CAM] Watchdog: no frame for {age:.0f}s -- restarting stream")
                 self._stop_reader = True
-                self._thread.join(timeout=5)  # max 5s wachten
+                self._thread.join(timeout=5)  # wait max 5s
                 if self._thread.is_alive():
-                    print("[CAM] Waarschuwing: oude reader thread nog actief na 5s timeout")
-                # Nu pas nieuwe thread starten (geen dubbele RTSP-verbinding meer)
+                    print("[CAM] Warning: old reader thread still active after 5s timeout")
+                # Only now start a new thread (no more duplicate RTSP connection)
                 self._stop_reader = False
-                self._last_frame_time = time.time()  # voorkom directe herhaling
+                self._last_frame_time = time.time()  # prevent immediate re-trigger
                 self._thread = threading.Thread(target=self._reader_loop, daemon=True)
                 self._thread.start()
-                print("[CAM] Reader thread herstart.")
+                print("[CAM] Reader thread restarted.")
 
     def read(self):
-        """Geeft (True, frame) of (False, None) -- nooit blokkerend."""
+        """Returns (True, frame) or (False, None) -- never blocking."""
         with self._lock:
             if self._frame is None:
                 return False, None
@@ -512,7 +507,7 @@ class RTSPReader:
 
 
 # =============================================================================
-# HOOFD DETECTIE-LOOP
+# MAIN DETECTION LOOP
 # =============================================================================
 def detect_objects():
     global output_frame, is_night
@@ -524,13 +519,13 @@ def detect_objects():
     labels = read_label_file(LABEL_PATH)
 
     camera = RTSPReader(RTSP_URL)
-    print("[CAM] Wachten op eerste frame...")
+    print("[CAM] Waiting for first frame...")
     while True:
         ok, _ = camera.read()
         if ok:
             break
         time.sleep(0.2)
-    print("[CAM] Stream actief.")
+    print("[CAM] Stream active.")
 
     tracker = CentroidTracker()
 
@@ -538,8 +533,8 @@ def detect_objects():
 
     while True:
         try:
-            # Throttle detectie-loop tot DETECT_FPS (standaard 8 fps).
-            # Voorkomt dat de Coral + frame-resizing onnodig snel draait.
+            # Throttle the detection loop to DETECT_FPS (default 8 fps).
+            # Prevents the Coral + frame resizing from running unnecessarily fast.
             now_t = time.time()
             sleep_t = _DETECT_INTERVAL - (now_t - last_detect_time)
             if sleep_t > 0:
@@ -589,7 +584,7 @@ def detect_objects():
                 cv2.addWeighted(overlay, 0.18, trace_frame, 0.82, 0, trace_frame)
                 cv2.line(trace_frame, (arx, 0), (arx, h), (0, 180, 180), 1)
                 cv2.line(trace_frame, (0, ary), (w, ary), (0, 180, 180), 1)
-                cv2.putText(trace_frame, "BRIEVENBUS", (mx1 + 2, my1 - 6),
+                cv2.putText(trace_frame, "MAILBOX", (mx1 + 2, my1 - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 80, 255), 1)
                 cv2.putText(trace_frame, "EXCLUDE", (ex1 + 2, ey1 + 14),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 0, 180), 1)
@@ -604,7 +599,7 @@ def detect_objects():
                     trace_color = STATE_COLORS.get(post_state, (255, 100, 0))
                     cv2.polylines(trace_frame, [pts_arr], False, trace_color, 2)
 
-            # --- Verwerk gedetecteerde objecten ---
+            # --- Process detected objects ---
             found_objects = []
             for i, obj in enumerate(valid_objs):
                 label_name = frame_labels[i]
@@ -644,7 +639,7 @@ def detect_objects():
                     cv2.putText(trace_frame, label_txt, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
                     if is_post_confirmed:
-                        cv2.putText(trace_frame, "POST BEZORGD!", (20, 50),
+                        cv2.putText(trace_frame, "MAIL DELIVERED!", (20, 50),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
 
                 found_objects.append({
@@ -658,10 +653,10 @@ def detect_objects():
                     "cy_ai": int(cy_ai),
                 })
 
-            # --- Verstuur pending post bevestigingen (persoon al weg uit beeld) ---
+            # --- Send pending delivery confirmations (person already left the frame) ---
             for pending_id in list(tracker.pending_post_ids):
                 ts = datetime.datetime.now().strftime('%H:%M:%S')
-                # Snapshot encoding in de detectie-thread (frame is al klaar, encode is snel)
+                # Snapshot encoding in the detection thread (frame is already ready, encoding is fast)
                 _, _snap_buf = cv2.imencode('.jpg', trace_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
                 _snap_bytes = _snap_buf.tobytes()
                 def send_post_confirmed(pid, snap_bytes, night, timestamp):
@@ -680,7 +675,7 @@ def detect_objects():
                         client.publish(MQTT_TOPIC, json.dumps(payload), qos=0, retain=True)
                         print(f"[{timestamp}] MQTT: ID={pid} Label=persoon State={POST_STATE_CONFIRMED} New=False Post=True")
                     except Exception as e:
-                        print(f"MQTT Fout: {e}")
+                        print(f"MQTT Error: {e}")
                 _async_executor.submit(send_post_confirmed, pending_id, _snap_bytes, is_night, ts)
                 if pending_id not in tracker.mail_sent_ids:
                     _, _mail_buf = cv2.imencode('.jpg', trace_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -708,7 +703,7 @@ def detect_objects():
                     if primary['is_new_detection']:
                         tracker.reported_ids.add(primary['id'])
 
-                    # Snapshot encoding in de detectie-thread (frame is al klaar, encode is snel)
+                    # Snapshot encoding in the detection thread (frame is already ready, encoding is fast)
                     _, _snap_buf = cv2.imencode('.jpg', trace_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
                     _snap_bytes = _snap_buf.tobytes()
 
@@ -733,9 +728,9 @@ def detect_objects():
                                 f"New={p_obj['is_new_detection']} Post={p_obj['is_post']}"
                             )
                         except Exception as e:
-                            print(f"MQTT Fout: {e}")
+                            print(f"MQTT Error: {e}")
 
-                    # via executor: alleen de MQTT publish is async (kan soms brief blokkeren)
+                    # via executor: only the MQTT publish is async (can occasionally block briefly)
                     _async_executor.submit(
                         send_mqtt_async,
                         list(found_objects), _snap_bytes, is_night, ts, primary
@@ -746,9 +741,9 @@ def detect_objects():
                         send_post_email(_mail_buf.tobytes())
                         tracker.mail_sent_ids.add(primary['id'])
 
-            # Nacht-indicator
+            # Night indicator
             if is_night:
-                cv2.putText(trace_frame, "NACHT", (w - 80, 25),
+                cv2.putText(trace_frame, "NIGHT", (w - 80, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)
 
             with lock:
@@ -788,10 +783,10 @@ def video_feed():
 def index():
     return (
         "<html><body style='background:#111; color:#fff; font-family:sans-serif;'>"
-        "<h1>🪸 Coral AI — Post Detectie</h1>"
+        "<h1>🪸 Coral AI — Mailbox Detection</h1>"
         "<img src='/video_feed' width='800' style='border:2px solid #444;'>"
         "<p style='color:#aaa; font-size:13px;'>"
-        "Grijs=IDLE &nbsp; Geel=APPROACHING &nbsp; Oranje=AT_MAILBOX &nbsp; Rood=POST_CONFIRMED"
+        "Gray=IDLE &nbsp; Yellow=APPROACHING &nbsp; Orange=AT_MAILBOX &nbsp; Red=POST_CONFIRMED"
         "</p></body></html>"
     )
 

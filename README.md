@@ -1,107 +1,113 @@
-# 🪸 Web Detectie — Coral AI Postbode-detectiesysteem
+# 🪸 Web Detectie — Coral AI Mail Carrier Detection System
 
-RTSP-camera video-detectiesysteem op basis van een **Coral AI Edge TPU**, dat personen (o.a. de postbode) detecteert bij de brievenbus via een state machine, en de status publiceert naar **MQTT** (Home Assistant), verstuurt via **e-mail**, en toont via een ingebouwde **MJPEG webstream**.
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-orange?logo=buy-me-a-coffee&logoColor=white)](https://buymeacoffee.com/petervandersanden)
 
-## Inhoud
+RTSP camera video detection system based on a **Coral AI Edge TPU**, which detects people (e.g. the mail carrier) at the mailbox using a state machine, and publishes status to **MQTT** (Home Assistant), sends via **email**, and displays via a built-in **MJPEG web stream**.
 
-- [Functionaliteit](#functionaliteit)
-- [Architectuur](#architectuur)
-- [Postbode state machine](#postbode-state-machine)
-- [Vereisten](#vereisten)
-- [Installatie](#installatie)
-- [Configuratie (config.ini)](#configuratie-configini)
-- [Gebruik](#gebruik)
+> ☕ If this project is useful to you, consider [buying me a coffee](https://buymeacoffee.com/petervandersanden).
+
+## Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Mail carrier state machine](#mail-carrier-state-machine)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration (config.ini)](#configuration-configini)
+- [Usage](#usage)
 - [MQTT payload](#mqtt-payload)
-- [Webinterface](#webinterface)
-- [Debug-overlay](#debug-overlay)
-- [Belangrijke implementatiedetails](#belangrijke-implementatiedetails)
+- [Web interface](#web-interface)
+- [Debug overlay](#debug-overlay)
+- [Key implementation details](#key-implementation-details)
 
-## Functionaliteit
+## Features
 
-- Leest een RTSP-camerastream (bv. Hikvision) in een aparte thread met **watchdog** (automatisch herverbinden bij vastlopen).
-- Voert objectdetectie uit met een **Coral Edge TPU**-model (via `pycoral`), gefilterd op `target_labels` uit de config (bv. `persoon`).
-- Houdt objecten tussen frames bij met een lichtgewicht **centroid tracker** (eigen ID per object, geen zware re-ID-modellen).
-- Herkent het **postbode-bezoekpatroon** (aankomst → brievenbus → vertrek) via een aparte state machine per persoon, met valse-positievenfilters (exclude-zone, richtingscheck, dwell-tijd).
-- Onderscheidt **dag/nacht** op basis van gemiddelde helderheid van het beeld en gebruikt een lagere confidence-drempel en detectie-interval 's nachts.
-- Publiceert detecties + snapshot naar **MQTT** (retained), met throttling via `mqtt.interval`.
-- Verstuurt optioneel een **e-mail met foto** zodra een postbezorging bevestigd is.
-- Toont een live **MJPEG-videofeed met debug-overlay** via een ingebouwde Flask/Waitress webserver (`/video_feed`, `/`).
-- Alle MQTT- en mailacties lopen via een gedeelde `ThreadPoolExecutor` zodat de detectie-loop niet blokkeert.
+- Reads an RTSP camera stream (e.g. Hikvision) in a separate thread with a **watchdog** (automatic reconnect on stall).
+- Performs object detection with a **Coral Edge TPU** model (via `pycoral`), filtered on `target_labels` from the config (e.g. `person`).
+- Tracks objects across frames with a lightweight **centroid tracker** (own ID per object, no heavy re-ID models).
+- Recognizes the **mail carrier visit pattern** (arrival → mailbox → departure) via a separate state machine per person, with false-positive filters (exclude zone, direction check, dwell time).
+- Distinguishes **day/night** based on average image brightness and uses a lower confidence threshold and detection interval at night.
+- Publishes detections + snapshot to **MQTT** (retained), with throttling via `mqtt.interval`.
+- Optionally sends an **email with photo** as soon as a delivery is confirmed.
+- Shows a live **MJPEG video feed with debug overlay** via a built-in Flask/Waitress web server (`/video_feed`, `/`).
+- All MQTT and mail actions run through a shared `ThreadPoolExecutor` so the detection loop never blocks.
 
-## Architectuur
+## Architecture
 
 ```
 RTSPReader (thread)          detect_objects() (thread)         Flask/Waitress (main thread)
-  └─ leest camera frames  →    ├─ Coral TPU inference               └─ /video_feed (MJPEG stream)
-     met watchdog-herstart      ├─ CentroidTracker (ID-toewijzing)   └─ / (HTML preview pagina)
+  └─ reads camera frames  →    ├─ Coral TPU inference               └─ /video_feed (MJPEG stream)
+     with watchdog restart      ├─ CentroidTracker (ID assignment)   └─ / (HTML preview page)
                                 ├─ PostTracker (state machine)
                                 ├─ MQTT publish (async, executor)
-                                └─ E-mail bij bevestiging (async, executor)
+                                └─ Email on confirmation (async, executor)
 ```
 
-- **`RTSPReader`** — eigen thread die continu frames leest (throttled op `reader_fps`), met een **watchdog-thread** die de stream herstart als er > `WATCHDOG_SECONDS` (8s) geen nieuw frame binnenkomt. Voorkomt dubbele RTSP-sessies door netjes op de oude thread te wachten (`join()`) voordat een nieuwe start.
-- **`CentroidTracker`** — matcht detecties tussen frames op basis van label + afstand tussen centroïdes, kent IDs toe/verwijdert ze na `max_disappeared` gemiste frames, en reset zichzelf volledig als er > `reset_seconds` niets is gezien.
-- **`PostTracker`** — losstaande state machine per object-ID die het postbezorgpatroon herkent (zie hieronder).
-- **Detectie-loop** (`detect_objects`) — de hoofd-thread die frames ophaalt, inference draait, tracking/state bijwerkt, de debug-overlay tekent en MQTT/mail triggert. Gethrottled op `detect_fps`.
-- **Webserver** — Flask app geserveerd via **Waitress** (production WSGI server), toont de laatste frame met overlay als MJPEG-stream.
+- **`RTSPReader`** — dedicated thread that continuously reads frames (throttled to `reader_fps`), with a **watchdog thread** that restarts the stream if no new frame arrives for more than `WATCHDOG_SECONDS` (8s). Prevents duplicate RTSP sessions by cleanly waiting for the old thread (`join()`) before starting a new one.
+- **`CentroidTracker`** — matches detections across frames based on label + distance between centroids, assigns/removes IDs after `max_disappeared` missed frames, and fully resets itself if nothing has been seen for more than `reset_seconds`.
+- **`PostTracker`** — standalone state machine per object ID that recognizes the delivery pattern (see below).
+- **Detection loop** (`detect_objects`) — the main thread that fetches frames, runs inference, updates tracking/state, draws the debug overlay, and triggers MQTT/mail. Throttled to `detect_fps`.
+- **Web server** — Flask app served via **Waitress** (production WSGI server), shows the latest frame with overlay as an MJPEG stream.
 
-## Postbode state machine
+## Mail carrier state machine
 
-Alle zone-coördinaten zijn in **AI-coördinaten (0–300)**, de resolutie van het detectiemodel.
+All zone coordinates are in **AI coordinates (0–300)**, the resolution of the detection model.
 
-| State | Betekenis |
+| State | Meaning |
 |---|---|
-| `IDLE` | Rusttoestand, wacht op aankomst van rechts |
-| `APPROACHING` | Persoon beweegt van rechts naar de brievenbus |
-| `AT_MAILBOX` | Persoon bevindt zich in de brievenbus-zone |
-| `DEPARTING` | Persoon verlaat de brievenbus, richting rechts |
-| `POST_CONFIRMED` | Volledig patroon bevestigd → post bezorgd |
+| `IDLE` | Rest state, waiting for arrival from the right |
+| `APPROACHING` | Person moving from the right toward the mailbox |
+| `AT_MAILBOX` | Person is located in the mailbox zone |
+| `DEPARTING` | Person is leaving the mailbox, moving right |
+| `POST_CONFIRMED` | Full pattern confirmed → mail delivered |
 
-**Drie harde voorwaarden voor `POST_CONFIRMED`:**
+**Three hard requirements for `POST_CONFIRMED`:**
 
-1. **Aankomst** — track start rechtsboven (`cx > arrive_min_cx`, `cy < arrive_max_cy`), niet in de exclude-zone, en beweegt vervolgens naar de brievenbus (`approach_min_seconds` lang).
-2. **Post** — persoon bevindt zich in `mailbox_zone` tussen `mailbox_dwell_min` en `mailbox_dwell_max` seconden.
-3. **Vertrek** — persoon verlaat de brievenbus en beweegt terug naar rechts (`cx > depart_min_cx`).
+1. **Arrival** — track starts top-right (`cx > arrive_min_cx`, `cy < arrive_max_cy`), not in the exclude zone, and then moves toward the mailbox (for `approach_min_seconds`).
+2. **Delivery** — person is in the `mailbox_zone` for between `mailbox_dwell_min` and `mailbox_dwell_max` seconds.
+3. **Departure** — person leaves the mailbox and moves back to the right (`cx > depart_min_cx`).
 
-**Valse-positievenfilters:**
-- **Exclude-zone** rechtsboven negeert voorbijgangers die niet richting brievenbus lopen.
-- **Richtingseis** bij aankomst en vertrek (cx moet af-/toenemen), gebaseerd op de laatste 3 posities in de bewegingsgeschiedenis.
-- **Dwell max** — te lang stilstaan bij de brievenbus wordt niet als postbode gezien (reset).
-- Als een persoon tijdens `DEPARTING` uit beeld verdwijnt (bv. buiten cameraradius) op de juiste positie, wordt de bezorging alsnog bevestigd (`pending_post_ids`) zodra de tracker het object opruimt.
-- Na bevestiging volgt een **cooldown** (`post_cooldown`) voordat dezelfde ID weer kan triggeren.
+**False-positive filters:**
+- **Exclude zone** top-right ignores passersby not walking toward the mailbox.
+- **Direction requirement** on arrival and departure (cx must decrease/increase), based on the last 3 positions in the movement history.
+- **Max dwell** — standing at the mailbox too long is not treated as the mail carrier (reset).
+- If a person disappears from view during `DEPARTING` (e.g. outside camera range) at the correct position, the delivery is still confirmed (`pending_post_ids`) once the tracker cleans up the object.
+- After confirmation, a **cooldown** (`post_cooldown`) applies before the same ID can trigger again.
 
-## Vereisten
+## Requirements
 
-- Python 3 met:
+- Python 3 with:
   - `opencv-python` (`cv2`)
   - `numpy`
   - `paho-mqtt` (v2 callback API)
   - `flask`
   - `waitress`
   - `pycoral` (Coral Edge TPU runtime + libraries)
-- **Coral USB/PCIe Edge TPU** met een gecompileerd `.tflite`-model + labelbestand.
-- RTSP-camera (bv. Hikvision) bereikbaar op het netwerk.
-- MQTT-broker (bv. Mosquitto, of de Home Assistant-broker).
-- (Optioneel) SMTP-account voor e-mailnotificaties.
+- **Coral USB/PCIe Edge TPU** with a compiled `.tflite` model + label file.
+- RTSP camera (e.g. Hikvision) reachable on the network.
+- MQTT broker (e.g. Mosquitto, or the Home Assistant broker).
+- (Optional) SMTP account for email notifications.
 
-## Installatie
+## Installation
 
 ```bash
 pip install opencv-python numpy paho-mqtt flask waitress
-# Coral/pycoral installeren volgens de officiële Coral-documentatie
-# (Edge TPU runtime + pycoral libraries, afhankelijk van je platform)
+# Install Coral/pycoral according to the official Coral documentation
+# (Edge TPU runtime + pycoral libraries, depending on your platform)
 ```
 
-Plaats `config.ini` in dezelfde map als `web_detectie.py` (zie hieronder).
+Place `config.ini` in the same folder as `mailbox_detection.py` (see below).
 
-## Configuratie (config.ini)
+> **Note:** the `config.ini` section/key names (`[detectie]`, `[post_detectie]`, etc.) and the internal label check `'persoon'` were intentionally left as-is, since they must keep matching your existing `config.ini` and Edge TPU label file. Let me know if you'd like those renamed to English too — that would also require updating `config.ini` and the label file to match.
 
-Het script leest alle instellingen uit een `config.ini` naast het scriptbestand. Voorbeeldstructuur:
+## Configuration (config.ini)
+
+The script reads all settings from a `config.ini` next to the script file. Example structure:
 
 ```ini
 [camera]
-model_path = /pad/naar/model.tflite
-label_path = /pad/naar/labels.txt
+model_path = /path/to/model.tflite
+label_path = /path/to/labels.txt
 rtsp_url = rtsp://user:pass@camera-ip:554/stream
 reader_fps = 15
 detect_fps = 8
@@ -116,17 +122,17 @@ interval = 2.0
 
 [mail]
 enabled = true
-smtp_server = smtp.voorbeeld.nl
+smtp_server = smtp.example.com
 smtp_port = 587
-from_addr = postdetectie@voorbeeld.nl
-from_name = Postdetectie
-to_addr = jij@voorbeeld.nl
+from_addr = maildetection@example.com
+from_name = Mail Detection
+to_addr = you@example.com
 
 [detectie]
 min_confidence_day = 0.55
 min_confidence_night = 0.45
 night_interval = 5.0
-target_labels = persoon
+target_labels = person
 
 [post_detectie]
 mailbox_zone = 78,130,102,188
@@ -150,74 +156,76 @@ draw_debug = true
 draw_traces_debug = true
 ```
 
-> ⚠️ Bovenstaande waarden zijn illustratief — pas zone-coördinaten aan op basis van je eigen camerabeeld (AI-coördinaten lopen van 0–300, ongeacht de werkelijke cameraresolutie).
+> ⚠️ The values above are illustrative — adjust the zone coordinates based on your own camera view (AI coordinates run from 0–300, regardless of the actual camera resolution).
 
-**Zone-formaat:** `x1,y1,x2,y2` in AI-coördinaten (0–300), waarbij (0,0) linksboven is.
+**Zone format:** `x1,y1,x2,y2` in AI coordinates (0–300), where (0,0) is top-left.
 
-## Gebruik
+## Usage
 
 ```bash
-python3 web_detectie.py
+python3 mailbox_detection.py
 ```
 
-- De detectie-loop start automatisch in een achtergrondthread.
-- De webserver draait op poort **5000** (`0.0.0.0:5000`), via Waitress met 6 threads.
+- The detection loop starts automatically in a background thread.
+- The web server runs on port **5000** (`0.0.0.0:5000`), via Waitress with 6 threads.
 - Live preview: `http://<host>:5000/`
-- Ruwe MJPEG-stream: `http://<host>:5000/video_feed`
+- Raw MJPEG stream: `http://<host>:5000/video_feed`
 
 ## MQTT payload
 
-Bij elke detectie (max. 1x per `mqtt.interval` seconden) wordt gepubliceerd op het geconfigureerde topic:
+On every detection (max. once per `mqtt.interval` seconds), the following is published to the configured topic:
 
 ```json
 {
   "timestamp": "14:32:10",
-  "label": "persoon",
+  "label": "person",
   "id": 3,
   "score": 87,
   "is_post": false,
   "post_state": "APPROACHING",
   "is_new_detection": true,
   "is_night": false,
-  "detections": [ /* array van alle gedetecteerde objecten in dit frame */ ]
+  "detections": [ /* array of all detected objects in this frame */ ]
 }
 ```
 
-Daarnaast wordt op `<topic>/snapshot` een JPEG-snapshot (retained) gepubliceerd bij elke MQTT-update.
+In addition, a JPEG snapshot (retained) is published to `<topic>/snapshot` on every MQTT update.
 
-Zodra `is_post: true` en `post_state: "POST_CONFIRMED"`, is de bezorging bevestigd — dit is ook het moment waarop (indien ingeschakeld) de e-mail met snapshot wordt verstuurd.
+Once `is_post: true` and `post_state: "POST_CONFIRMED"`, the delivery is confirmed — this is also the moment (if enabled) that the email with snapshot is sent.
 
-## Webinterface
+## Web interface
 
-- **`/`** — eenvoudige HTML-pagina met de live stream en een kleurlegenda:
-  - Grijs = `IDLE`
-  - Geel = `APPROACHING`
-  - Oranje = `AT_MAILBOX`
-  - Rood = `POST_CONFIRMED`
-- **`/video_feed`** — multipart MJPEG-stream (bruikbaar als camera-bron in Home Assistant of een `<img>`-tag).
+- **`/`** — simple HTML page with the live stream and a color legend:
+  - Gray = `IDLE`
+  - Yellow = `APPROACHING`
+  - Orange = `AT_MAILBOX`
+  - Red = `POST_CONFIRMED`
+- **`/video_feed`** — multipart MJPEG stream (usable as a camera source in Home Assistant or an `<img>` tag).
 
-## Debug-overlay
+## Debug overlay
 
-Indien `debug.draw_debug = true`:
-- Brievenbus-zone en exclude-zone worden als gekleurde vlakken getekend.
-- Aankomst-/vertreklijnen (`arrive_min_cx` / `arrive_max_cy`) als referentielijnen.
-- Bounding box + ID + label + state per gedetecteerd object, in de kleur van de huidige state.
-- "POST BEZORGD!" tekst bij bevestiging.
+If `debug.draw_debug = true`:
+- The mailbox zone and exclude zone are drawn as colored areas.
+- Arrival/departure lines (`arrive_min_cx` / `arrive_max_cy`) as reference lines.
+- Bounding box + ID + label + state per detected object, colored by current state.
+- "POST DELIVERED!" text upon confirmation.
 
-Indien `debug.draw_traces_debug = true`:
-- Bewegingssporen (polylines) per object-ID, gekleurd naar state.
+If `debug.draw_traces_debug = true`:
+- Movement traces (polylines) per object ID, colored by state.
 
-'s Nachts verschijnt rechtsboven in beeld een "NACHT"-indicator.
+At night, a "NIGHT" indicator appears in the top-right of the frame.
 
-## Belangrijke implementatiedetails
+## Key implementation details
 
-- **Threading-architectuur**: cameralezen, inference/tracking en de webserver draaien in aparte threads; MQTT-publicaties en e-mailverzending lopen via een gedeelde `ThreadPoolExecutor(max_workers=2)` zodat de detectie-loop niet blokkeert op netwerk-I/O.
-- **Paho MQTT v2**: client wordt aangemaakt met `CallbackAPIVersion.VERSION2`.
-- **Throttling**: aparte FPS-limieten voor het uitlezen van de camera (`reader_fps`, standaard 15) en de detectie/inference-loop (`detect_fps`, standaard 8), instelbaar via `config.ini`.
-- **RTSP-stabiliteit**: watchdog herkent een vastgelopen stream (geen nieuw frame > 8s) en herstart de reader-thread pas ná bevestigde afsluiting van de oude thread, om dubbele verbindingen naar de camera te voorkomen (belangrijk bij Hikvision's verbindingslimiet).
-- **AI- vs pixelcoördinaten**: alle zonelogica werkt in AI-coördinaten (0–300, het model-inputformaat); `ai_to_px()` / `ai_zone_to_px()` zetten dit om naar pixels voor de overlay op het volledige camerabeeld.
-- **Exception-afscherming**: de hoofdloop vangt fouten per iteratie af en logt ze, zodat een incidentele fout (bv. camerahapering) de hele service niet laat crashen.
+- **Threading architecture**: camera reading, inference/tracking, and the web server run in separate threads; MQTT publishing and email sending run through a shared `ThreadPoolExecutor(max_workers=2)` so the detection loop never blocks on network I/O.
+- **Paho MQTT v2**: client is created with `CallbackAPIVersion.VERSION2`.
+- **Throttling**: separate FPS limits for reading the camera (`reader_fps`, default 15) and the detection/inference loop (`detect_fps`, default 8), configurable via `config.ini`.
+- **RTSP stability**: the watchdog detects a stalled stream (no new frame for > 8s) and restarts the reader thread only after confirmed shutdown of the old thread, to prevent duplicate connections to the camera (important given Hikvision's connection limit).
+- **AI vs. pixel coordinates**: all zone logic works in AI coordinates (0–300, the model input format); `ai_to_px()` / `ai_zone_to_px()` convert this to pixels for the overlay on the full camera image.
+- **Exception isolation**: the main loop catches and logs errors per iteration, so an occasional error (e.g. a camera hiccup) doesn't crash the whole service.
 
 ---
 
-*Dit README.md is automatisch gegenereerd op basis van analyse van `web_detectie.py`. Vul de config.ini-voorbeeldwaarden aan/pas ze aan met je eigen camera-, MQTT- en mailgegevens.*
+☕ **Enjoying this project?** Support further development via [Buy Me a Coffee](https://buymeacoffee.com/petervandersanden).
+
+*This README.md was automatically generated based on analysis of `mailbox_detection.py`. Fill in/adjust the config.ini example values with your own camera, MQTT, and mail settings.*
