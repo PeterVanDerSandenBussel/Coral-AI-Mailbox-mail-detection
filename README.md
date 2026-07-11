@@ -1,4 +1,4 @@
-# 🪸 Web Detectie — Coral AI Mail Carrier Detection System
+# 🪸 Coral AI Mail Carrier Detection System
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-orange?logo=buy-me-a-coffee&logoColor=white)](https://buymeacoffee.com/petervandersanden)
 
