@@ -30,6 +30,16 @@ MODEL_PATH = _cfg.get('camera', 'model_path')
 LABEL_PATH = _cfg.get('camera', 'label_path')
 RTSP_URL   = _cfg.get('camera', 'rtsp_url')
 
+# RTSP connection/read timeouts -- without these, cv2.VideoCapture.read() can
+# block forever on a stalled stream, which leaves the reader thread stuck and
+# leaks a duplicate RTSP connection to the camera every time the watchdog
+# tries (and fails) to restart it. This eventually exhausts the camera's
+# connection limit, blocking both this app and other RTSP viewers.
+CAM_OPEN_TIMEOUT_MS  = _cfg.getint('camera', 'open_timeout_ms')  if _cfg.has_option('camera', 'open_timeout_ms')  else 5000
+CAM_READ_TIMEOUT_MS  = _cfg.getint('camera', 'read_timeout_ms')  if _cfg.has_option('camera', 'read_timeout_ms')  else 5000
+CAM_WATCHDOG_SECONDS = _cfg.getint('camera', 'watchdog_seconds') if _cfg.has_option('camera', 'watchdog_seconds') else 8
+CAM_RECONNECT_DELAY  = _cfg.getfloat('camera', 'reconnect_delay') if _cfg.has_option('camera', 'reconnect_delay') else 3.0
+
 MQTT_BROKER   = _cfg.get('mqtt', 'broker')
 MQTT_PORT     = _cfg.getint('mqtt', 'port')
 MQTT_USER     = _cfg.get('mqtt', 'user')
@@ -435,7 +445,7 @@ STATE_COLORS = {
 # RTSP CAMERA READER - separate thread with watchdog
 # =============================================================================
 class RTSPReader:
-    WATCHDOG_SECONDS = 8  # Reconnect after N seconds with no new frame
+    WATCHDOG_SECONDS = CAM_WATCHDOG_SECONDS  # Reconnect after N seconds with no new frame
 
     def __init__(self, url):
         self.url = url
@@ -452,6 +462,12 @@ class RTSPReader:
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
         c = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
         c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Without these, cap.read() can block forever on a stalled stream
+        # instead of failing fast so the reader loop can reconnect.
+        open_prop = getattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC', 53)
+        read_prop = getattr(cv2, 'CAP_PROP_READ_TIMEOUT_MSEC', 54)
+        c.set(open_prop, CAM_OPEN_TIMEOUT_MS)
+        c.set(read_prop, CAM_READ_TIMEOUT_MS)
         return c
 
     def _reader_loop(self):
@@ -472,7 +488,7 @@ class RTSPReader:
             else:
                 print("[CAM] cap.read() failed -- reconnecting...")
                 cap.release()
-                time.sleep(3)
+                time.sleep(CAM_RECONNECT_DELAY)
                 if not self._stop_reader:
                     cap = self._make_cap()
         cap.release()
@@ -488,9 +504,12 @@ class RTSPReader:
             if age > self.WATCHDOG_SECONDS:
                 print(f"[CAM] Watchdog: no frame for {age:.0f}s -- restarting stream")
                 self._stop_reader = True
-                self._thread.join(timeout=5)  # wait max 5s
+                # Reader may currently be blocked inside cap.read(); give it enough
+                # time to hit the read timeout + reconnect-sleep before giving up.
+                join_timeout = (CAM_READ_TIMEOUT_MS / 1000.0) + CAM_RECONNECT_DELAY + 2
+                self._thread.join(timeout=join_timeout)
                 if self._thread.is_alive():
-                    print("[CAM] Warning: old reader thread still active after 5s timeout")
+                    print(f"[CAM] Warning: old reader thread still active after {join_timeout:.0f}s timeout")
                 # Only now start a new thread (no more duplicate RTSP connection)
                 self._stop_reader = False
                 self._last_frame_time = time.time()  # prevent immediate re-trigger
